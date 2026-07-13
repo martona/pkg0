@@ -1,0 +1,231 @@
+# pkg0 - implementation spec
+
+A sidecar package manager for `.deb`s (later `.rpm`s) published outside distro repos, primarily via
+GitHub Releases. Invoked separately from apt; never touches apt's own inventory. Goal: stay ahead of
+glacial distro repos with three commands and one state file.
+
+```
+pkg0 install <url> [--no-attest]
+pkg0 update  [<name>...] [--force]
+pkg0 remove  <name>
+pkg0 list
+pkg0 rollback <name>          # v1.1, trivial given the cache
+```
+
+---
+
+## 1. URL grammar
+
+`pkg0 install` accepts one argument, a URL. Three shapes:
+
+| Shape | Example | Discovery method |
+|---|---|---|
+| **GitHub `latest/download` + literal asset** | `https://github.com/o/r/releases/latest/download/foo-amd64.deb` | GitHub Releases API |
+| **GitHub `latest/download` + glob** | `https://github.com/o/r/releases/latest/download/foo-linux-*-amd64.deb` | GitHub Releases API |
+| **Plain stable URL** (vendor-hosted, version-less filename) | `https://downloads.rclone.org/rclone-current-linux-amd64.deb` | HEAD polling |
+
+The glob URL is **never fetched**. It is syntactic sugar: parse out `owner`, `repo`, and the asset
+pattern, then resolve via the API (3). Globbing is `fnmatch`-style against asset names.
+
+Anything under `github.com/*/*/releases/` that is *not* `latest/download` (e.g. a pinned
+`download/v1.2.3/...` URL) installs that exact file and is recorded as **pinned** - `update` skips it.
+
+## 2. State
+
+Single JSON file, root-owned since installs are root operations: `/var/lib/pkg0/state.json`.
+Deb cache: `/var/cache/pkg0/<name>/` (keep last **3** debs per package; prune older on successful install).
+
+Per-package record:
+
+```json
+{
+  "clipp": {
+    "source":       "github",                      // github | url
+    "repo":         "martona/clipp",               // github only
+    "asset_glob":   "clipp-linux-*-amd64.deb",     // github only
+    "url":          null,                          // url source only
+    "pkg_name":     "clipp",                       // from dpkg-deb, NOT the filename
+    "installed_ver":"1.2.3",                       // from dpkg-deb at install time
+    "tag":          "v1.2.3",                      // github only
+    "asset_name":   "clipp-linux-v1.2.3-amd64.deb",
+    "etag":         "\"abc123...\"",               // of /releases/latest response
+    "last_modified":null,                          // url source: HEAD Last-Modified
+    "size":         1234567,                       // url source: HEAD Content-Length
+    "attest":       "required",                    // required | none | opted-out
+    "pinned":       false,
+    "installed_at": "2026-07-13T14:00:00Z"
+  }
+}
+```
+
+`pkg_name` and `installed_ver` come from `dpkg-deb -f file.deb Package Version` - never derived
+from the filename.
+
+## 3. Discovery
+
+### 3.1 gh present & authed (preferred path)
+
+Detect once per run: `gh auth status >/dev/null 2>&1`. If OK, use gh for everything -
+5,000 req/hr, no hand-rolled REST:
+
+```sh
+# poll / resolve
+gh api repos/$REPO/releases/latest \
+   -H "If-None-Match: $CACHED_ETAG" -i        # -i to read status + new ETag from headers
+# 304  up to date, stop. 200  parse JSON below.
+
+# or higher-level:
+gh release view --repo $REPO --json tagName,assets
+
+# fetch (implements the glob natively)
+gh release download --repo $REPO --pattern "$ASSET_GLOB" --dir "$TMPDIR"
+```
+
+### 3.2 gh absent/unauthed (fallback)
+
+Plain `curl` against the same endpoint works unauthenticated for public repos:
+
+```sh
+curl -sS -D "$HDRS" -H "If-None-Match: $CACHED_ETAG" \
+     https://api.github.com/repos/$REPO/releases/latest
+```
+
+Rate limit is 60/hr/IP, **but 304 responses don't count against it** - so routine polling of
+dozens of packages is fine. Only cold installs and `--force` runs consume quota. On a 403
+rate-limit response: report it, suggest installing/authing gh, and treat affected packages as
+"not checked" (no state change).
+
+### 3.3 Asset resolution (both paths)
+
+From the `/releases/latest` JSON (drafts and prereleases are already excluded by this endpoint):
+
+1. Glob-match `asset_glob` against `assets[].name`.
+2. **0 matches, tag is new**  assets may still be uploading. Print "release $TAG found but no
+   matching asset yet; will retry next run." No state change, exit 0 for this package.
+3. **ò2 matches**  hard error listing the matches. Never guess. (User fixes the glob;
+   common trap: glob catches both the `.deb` and a `.deb.asc`, or amd64 *and* arm64.)
+4. **1 match**  take `browser_download_url`, `name`, `size`.
+
+### 3.4 Plain-URL sources
+
+`HEAD $URL`, compare `Last-Modified` + `Content-Length` against state. Either changed  download
+and proceed. (This scheme is only sound for direct, non-redirecting stable URLs; GitHub
+`latest/download` URLs 302 to per-request signed URLs and must use the API path instead.)
+
+## 4. Update decision
+
+New tag alone isn't authoritative - compare **actual installed version** so out-of-band updates
+(vendor selfupdate, manual dpkg) don't confuse pkg0:
+
+```sh
+CANDIDATE_VER=$(dpkg-deb -f "$DEB" Version)
+CURRENT_VER=$(dpkg-query -W -f '${Version}' "$PKG_NAME" 2>/dev/null || echo "")
+if [ -n "$CURRENT_VER" ] && dpkg --compare-versions "$CANDIDATE_VER" le "$CURRENT_VER"; then
+    skip   # already current or newer; refresh state (tag/etag) and move on
+fi
+```
+
+Never string-compare tags (`v` prefixes, `rc` suffixes, epochs).
+
+## 5. Attestation
+
+### 5.1 Mechanics
+
+```sh
+gh attestation verify "$DEB" --repo "$REPO"     # requires authed gh (any PAT, no scopes)
+```
+
+Existence check without auth (public REST endpoint):
+
+```sh
+DIGEST=$(sha256sum "$DEB" | cut -d' ' -f1)
+curl -fsS "https://api.github.com/repos/$REPO/attestations/sha256:$DIGEST"
+# non-empty  attestation exists, even if we can't verify it right now
+```
+
+No `SHA256SUMS` handling in v1 - deliberately out of scope.
+
+### 5.2 Policy matrix
+
+`attest` field is set at **install time** and only relaxed by explicit user action:
+
+| State of package | gh authed | gh missing/unauthed |
+|---|---|---|
+| **First install, attestation verifies** | Install; print **"û attestation verified (repo)"** loud & proud; record `attest: required` | Check existence via curl. Exists  **warn**: "attestation published but unverifiable - installing anyway"; record `attest: none`1 |
+| **First install, no attestation published** | Install normally; record `attest: none` | Same |
+| **First install, verification FAILS** | **Abort. Scream.** Delete the download. | n/a (can't fail what you can't run) |
+| **`--no-attest` passed** | Skip verify; record `attest: opted-out`; note it in output | Same |
+| **Update, `attest: required`** | Verify or **abort** (package stays at current version) | **Hold**: refuse upgrade, print "pinned attestation-required but gh unavailable - fix gh auth or rerun with --no-attest" |
+| **Update, `attest: none/opted-out`** | Opportunistically try verify; if it now passes, brag and upgrade to `required`ý | Install, warn if existence check says one is published |
+
+1 Optionally prompt to auth gh first - an attested first install is worth the friction.
+ý Ratchet up, never silently down. A previously-verified package whose attestation disappears or
+fails is the actual attack signal; that's exactly what `required` + abort protects.
+
+## 6. Install/upgrade execution
+
+```sh
+apt-get install -y "./$DEB"      # NOT dpkg -i: resolves deps, marks manual
+```
+
+1. Download to tmpdir; move into `/var/cache/pkg0/<name>/` only after attestation policy passes.
+2. `dpkg-deb -f`  `pkg_name`, `installed_ver` (also sanity check: file is actually a deb).
+3. Take the dpkg lock implicitly via apt; if apt/dpkg is locked, wait with
+   `-o DPkg::Lock::Timeout=60` rather than failing instantly.
+4. On success: update state (tag, etag, asset_name, versions), prune cache to last 3.
+5. On apt failure: leave state untouched, keep the downloaded deb in cache for inspection.
+
+Root required for install/update/remove; `pkg0 list` and dry-run discovery work unprivileged.
+
+## 7. Remove & rollback
+
+```sh
+pkg0 remove clipp     apt-get remove -y "$PKG_NAME"; delete state entry
+                       # keep cache dir unless --purge-cache
+pkg0 rollback clipp   apt-get install -y ./var/cache/pkg0/clipp/<previous>.deb
+                       # then mark pinned=true so the next `update` doesn't undo it
+```
+
+## 8. Output style
+
+- Per-package one-liner on `update`: `clipp  1.2.3  1.3.0  û attested` /
+  `rclone 1.71.0 (current)` / `foo  HELD - attestation unverifiable`.
+- Attestation success is always printed, never silent - that's the point.
+- Exit codes: 0 all good/held-by-policy, 1 hard failure (failed verify, apt error), 2 usage.
+
+## 9. Explicit non-goals (v1)
+
+- No apt interplay handling (pinning, sources.list.d detection). The mission is staying *ahead* of
+  the repo; if apt later overtakes a package, apt wins and nobody is hurt.
+- No SHA256SUMS verification.
+- No rpm/zypper/dnf backend yet - but keep install/remove behind a two-function shim
+  (`pkg_install_file`, `pkg_query_version`) so it's a small add.
+- No daemon/timer. `pkg0 update` is cheap; user wires it to cron/systemd-timer if desired.
+
+## 10. Edge cases checklist
+
+- [ ] New tag, assets not yet uploaded  retry-next-run, no state change (3.3.2)
+- [ ] Glob matches >1 asset  hard error with match list (3.3.3)
+- [ ] Asset replaced in-place under same tag  caught by version compare being `le`  skip;
+      acceptable v1 behavior (in-place mutation of a released deb is upstream malpractice anyway)
+- [ ] gh installed but token expired  treat as unauthed, not as verify-failure
+- [ ] 403 rate limit  report, skip, no state change
+- [ ] Downloaded file isn't a deb (HTML error page, wrong asset)  `dpkg-deb -f` fails  abort clean
+- [ ] Package also exists in apt repo and apt upgraded past us  version compare handles it; state
+      refreshes; no fight
+- [ ] Interrupted download  download to `*.part` in tmpdir, rename only when complete
+- [ ] Two pkg0 instances racing  `flock` on the state file for the whole run
+
+---
+
+### Skeleton (bash, ~300 lines total)
+
+```
+main()            dispatch, flock, root check for mutating verbs
+parse_source()    URL  {source, repo, glob | url}
+discover()        gh api / curl w/ ETag  {tag, asset_name, dl_url} | UP_TO_DATE | RETRY
+fetch()           gh release download / curl  tmpfile
+attest()          policy matrix from 5.2  OK | WARN | HOLD | ABORT
+install_deb()     apt-get install ./ + state update + cache prune
+cmd_install/update/remove/list/rollback()
+```
