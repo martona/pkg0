@@ -357,18 +357,24 @@ bundle_issuer() {  # $1: bundle → cert issuer string, or empty
     bundle_cert "$1" | openssl x509 -inform der -noout -issuer 2>/dev/null | sed 's/^issuer=//'
 }
 
-# verify_deb DEB REPO [SIGNER] → R_VERIFY=VERIFIED|MISMATCH|INVALID; R_IDENTITY on MISMATCH
+# verify_deb DEB REPO [SIGNER] → R_VERIFY=VERIFIED|MISMATCH|INVALID
+#   VERIFIED sets R_VERIFIED_ID (cert identity); MISMATCH sets R_IDENTITY
 verify_deb() {
     local deb="$1" repo="$2" signer="${3:-}"
     local re b
+    R_VERIFIED_ID=""
     if [ -n "$signer" ] && [ "$signer" != null ]; then
         re="^$(regex_escape "$signer")@"
     else
-        re="^https://github\\.com/$(regex_escape "$repo")/\\.github/workflows/[^@]+@refs/tags/"
+        # any workflow in the target repo, any ref: the repo boundary is the security
+        # line (attestations come from the repo's own store; the anchor rejects genuine
+        # certs from other repos). Tag-vs-branch adds nothing unless tags are protected,
+        # and it false-positives on real repos — non-tag refs are noted in output instead.
+        re="^https://github\\.com/$(regex_escape "$repo")/\\.github/workflows/[^@]+@"
     fi
     for b in "$TMP"/bundle.*.json; do
         [ -e "$b" ] || continue
-        cosign_try "$deb" "$b" "$re" && { R_VERIFY=VERIFIED; return; }
+        cosign_try "$deb" "$b" "$re" && { R_VERIFY=VERIFIED; R_VERIFIED_ID=$(bundle_identity "$b"); return; }
     done
     # signature may be fine under a different identity — distinguish mismatch from forgery
     for b in "$TMP"/bundle.*.json; do
@@ -400,8 +406,8 @@ mismatch_prompt() {  # $1: identity  $2: repo  $3: label → 0 trusted (sets R_S
     say ""
     say "attestation found and cryptographically valid, but it was produced by:"
     say "    $id"
-    say "pkg0 expected a workflow in $repo running from a tag."
-    say "This is normal for projects that release via a shared workflow or from a branch."
+    say "pkg0 expected a workflow in $repo."
+    say "This is normal for projects that release via a shared (reusable) workflow."
     read -r -p "Trust this workflow identity for future updates of $label? [y/N] " ans || ans=n
     case "$ans" in
         y|Y|yes) R_SIGNER="${id%%@*}"; return 0 ;;
@@ -477,6 +483,10 @@ attest_gate() {
     case "$R_VERIFY" in
         VERIFIED)
             say "✓ attestation verified ($repo)"
+            case "${R_VERIFIED_ID:-}" in
+                ""|*"@refs/tags/"*) : ;;
+                *) say "  note: built from ${R_VERIFIED_ID##*@} rather than a tag — same-repo workflow, trusted" ;;
+            esac
             if [ "$mode" = update ] && [ "$attest" != required ]; then
                 say "$label: attestation now verifies — ratcheting policy to 'required'"
             fi

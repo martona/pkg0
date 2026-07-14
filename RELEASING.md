@@ -18,16 +18,14 @@ gh release edit v0.1.0 --draft=false
 
 Publishing the draft is what makes it visible to `releases/latest` — i.e. to pkg0 clients.
 
-## Why the tag flow is canonical
+## Attestation identity
 
-pkg0 verifies its own updates against a derived identity regexp that pins tag refs
-(`.../workflows/[^@]+@refs/tags/`, PLAN.md §5.2). A tag-push build's attestation certificate
-names `_release.yml@refs/tags/vX.Y.Z` and passes out of the box.
-
-`release-manual.yml` (workflow_dispatch with a version input) exists to exercise the pipeline;
-its attestation names `@refs/heads/<branch>`, which pkg0 clients — including pkg0's own
-selfupdate — flag as an identity mismatch (trust prompt when interactive, HOLD otherwise).
-Don't ship real releases from it.
+pkg0 verifies updates against a derived identity regexp that accepts **any workflow in the
+source repo, on any ref** (`.../workflows/[^@]+@`, PLAN.md §5.2) — the repo, not the ref, is
+the security boundary. A tag-push build's certificate names `_release.yml@refs/tags/vX.Y.Z`; a
+`release-manual.yml` (workflow_dispatch) build names `@refs/heads/<branch>`. Both verify;
+non-tag refs get a one-line note in pkg0's output rather than a prompt. Prefer the tag flow
+because it's the tidier provenance story, not because the manual one breaks anything.
 
 ## Invariants the pipeline enforces
 

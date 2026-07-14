@@ -255,30 +255,40 @@ cosign verify-blob-attestation "$DEB" \
 **Identity regexp — derived, never user-written.** The cert's SAN names the *workflow identity*
 (`https://github.com/o/r/.github/workflows/x.yml@refs/tags/v1.2.3`), and every GitHub Actions
 user gets an equally genuine cert for *their* workflow — all security lives in the identity
-match. pkg0 templates it mechanically from the repospec, anchored and escaped, pinning tag refs:
+match. pkg0 templates it mechanically from the repospec, anchored and escaped: **any workflow in
+the target repo, any ref**:
 
 ```
-^https://github\.com/<repo_regex_escaped>/\.github/workflows/[^@]+@refs/tags/
+^https://github\.com/<repo_regex_escaped>/\.github/workflows/[^@]+@
 ```
 
 Pitfalls this template exists to prevent: unanchored substring matches (`martona/clipp` matches
 a cert from `notmartona/clipp` or `martona/clipp-utils` — genuine cert, attacker's repo),
 unescaped dots, missing scheme anchor.
 
-**Identity mismatch — trust prompt, in plain language.** The derived regexp fails on *genuine*
-attestations in two known-legitimate shapes: releases built by a **reusable workflow** (the SAN
-names the shared workflow's repo, not upstream's) and workflows released **from a branch**
-(e.g. `workflow_dispatch` from main → `@refs/heads/main`; confirmed in the wild — cli/cli
-releases from `deployment.yml@refs/heads/trunk`). When the signature is valid but the
+*Why no tag-ref pin (changed from the original design, which appended `refs/tags/`):* the repo
+boundary is the actual security line — the attestation is fetched from the target repo's own
+store, and the anchor rejects genuine certs from other repos. Pinning `@refs/tags/` on top of
+that only adds value when tag-protection rules make tags harder to push than branches (an
+attacker who can run a workflow in your repo can nearly always push a tag), and it
+false-positives on real repos immediately: cli/cli releases from `trunk`, and any
+workflow_dispatch-built release carries a branch ref. Same-repo non-tag refs are auto-trusted;
+the ref is noted in output (`note: built from refs/heads/master rather than a tag`) so nothing
+is silent.
+
+**Identity mismatch — trust prompt, in plain language.** With same-repo-any-ref auto-trusted,
+the derived regexp fails on *genuine* attestations in one remaining known-legitimate shape:
+releases built by a **reusable workflow**, where the SAN names the shared workflow's repo, not
+upstream's. When the signature is valid but the
 identity doesn't match, pkg0 must not just say "verification failed" — it says exactly what
 happened, so the trust decision the user is making is unmistakable:
 
 ```
 attestation found and cryptographically valid, but it was produced by:
     https://github.com/other-org/release-tooling/.github/workflows/release.yml@refs/heads/main
-pkg0 expected a workflow in martona/clipp running from a tag.
-This is normal for projects that release via a shared workflow or from a branch.
-Trust this exact identity for future updates of clipp? [y/N]
+pkg0 expected a workflow in martona/clipp.
+This is normal for projects that release via a shared (reusable) workflow.
+Trust this workflow identity for future updates of clipp? [y/N]
 ```
 
 Accept → persist as `signer` in state (the workflow path, i.e. the identity up to the `@` —
@@ -437,7 +447,8 @@ package it manages. So self-management is not a special subsystem; it's **one mo
 - [ ] No verifier on box → matrix right column; offer `pkg0 install sigstore/cosign` once, not naggingly
 - [ ] cosign on PATH too old (flag drift) → treat as absent for verification; say why
 - [ ] cosign bootstrap is TOFU → say so loudly at install; ratchet applies from then on
-- [ ] Identity mismatch (reusable workflow, branch ref) → plain-language trust prompt, persist
+- [ ] Same-repo attestation from a non-tag ref → auto-trusted; ref noted in output, never silent
+- [ ] Identity mismatch (cross-repo / reusable workflow) → plain-language trust prompt, persist
       `signer`; non-interactive → HOLD
 - [ ] Attestation endpoint 404 vs rate-limit 403 → distinguish: "none published" vs "couldn't check"
 - [ ] `bundle_url` blob is raw-snappy → embedded perl decoder; inline bundle still handled if present

@@ -1,14 +1,13 @@
 name: Release (manual)
 
-# Operator-triggered release for testing the pipeline. Defaults to draft; flip the
-# `publish` input to release immediately. Delegates to _release.yml.
+# Operator-triggered release. Defaults to draft; flip the `publish` input to
+# release immediately. Delegates to _release.yml.
 #
-# CAVEAT — attestation identity: a workflow_dispatch run executes on a branch ref, so
-# the attestation certificate names .../workflows/_release.yml@refs/heads/<branch>,
-# NOT @refs/tags/. pkg0 clients verifying with the derived tag-pinned regexp (its own
-# selfupdate included) will see an identity mismatch: trust prompt when interactive,
-# HOLD when not. Real releases should go through release-tag.yml (push a v* tag);
-# use this one to exercise the pipeline.
+# Attestation identity note: a workflow_dispatch run executes on a branch ref, so the
+# attestation certificate names .../workflows/_release.yml@refs/heads/<branch> rather
+# than @refs/tags/. pkg0 auto-trusts any workflow identity in the repo it installs
+# from (the repo, not the ref, is the security boundary) and prints the ref as a
+# note — so this is cosmetic, not a verification failure.
 
 on:
   workflow_dispatch:

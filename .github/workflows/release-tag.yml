@@ -5,11 +5,10 @@ name: Release (tag)
 # before publication — flip via `gh release edit --draft=false v0.1.0` or the UI's
 # Publish button.
 #
-# This is the CANONICAL release path for pkg0: the attestation certificate's identity
-# comes out as .../workflows/_release.yml@refs/tags/vX.Y.Z, which matches the
-# tag-pinned identity regexp pkg0 derives for its own selfupdate verification
-# (PLAN.md §5.2). Manual-dispatch builds carry a branch ref instead — see
-# release-manual.yml for the caveat.
+# The attestation certificate's identity comes out as
+# .../workflows/_release.yml@refs/tags/vX.Y.Z. Manual-dispatch builds carry a branch
+# ref instead; pkg0 trusts any same-repo workflow identity either way (PLAN.md §5.2),
+# so both paths produce client-verifiable releases — tag builds just read cleaner.
 #
 # No-ops when a release already exists for the tag: publishing a draft (e.g. one the
 # manual workflow built) creates the tag, which re-fires this push-triggered workflow;
