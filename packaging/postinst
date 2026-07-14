@@ -1,0 +1,51 @@
+#!/bin/sh
+# pkg0 postinst — seed pkg0 into its own state (PLAN.md §7.5).
+# Never clobbers an existing entry; honors the PKG0_LOCK_HELD handshake so a
+# selfupdate (parent pkg0 holds the flock, is blocked waiting on apt) can't deadlock.
+set -e
+
+STATE_DIR=/var/lib/pkg0
+STATE="$STATE_DIR/state.json"
+LOCK="$STATE_DIR/lock"
+SELF_REPO="__SELF_REPO__"
+SELF_GLOB="pkg0_*_all.deb"
+
+seed() {
+    mkdir -p "$STATE_DIR"
+    [ -s "$STATE" ] || printf '[]\n' > "$STATE"
+    chmod 0644 "$STATE"
+    # seed only if entry absent — postinst on upgrade must not clobber state
+    if jq -e --arg r "$SELF_REPO" \
+        '.[] | select(.repo == $r and .pkg_name == "pkg0")' "$STATE" >/dev/null 2>&1; then
+        return 0
+    fi
+    ver=$(dpkg-query -W -f '${Version}' pkg0 2>/dev/null || echo "")
+    tmp=$(mktemp "$STATE_DIR/.state.XXXXXX")
+    jq --arg r "$SELF_REPO" --arg g "$SELF_GLOB" --arg v "$ver" \
+       --arg ts "$(date -u +%FT%TZ)" \
+       '. + [{repo: $r, glob: $g, pkg_name: "pkg0",
+              installed_ver: (if $v == "" then null else $v end),
+              tag: null, asset_name: null, asset_digest: null, etag: null,
+              attest: "required", signer: null, pinned: false,
+              needs_resolve: false, installed_at: $ts}]' "$STATE" > "$tmp"
+    chmod 0644 "$tmp"
+    mv "$tmp" "$STATE"
+}
+
+case "${1:-}" in
+    configure)
+        if [ "${PKG0_LOCK_HELD:-}" = "1" ]; then
+            # ancestor pkg0 holds the flock and is blocked on apt — write lock-free
+            seed
+        else
+            mkdir -p "$STATE_DIR"
+            if exec 9>>"$LOCK" && flock -w 30 9; then
+                seed
+            else
+                echo "pkg0 postinst: could not take state lock; will seed on first run" >&2
+            fi
+        fi
+        ;;
+esac
+
+exit 0

@@ -1,0 +1,987 @@
+#!/usr/bin/env bash
+# pkg0 — sidecar package manager for .debs published via GitHub Releases.
+# Spec: PLAN.md (v3). curl-only, cosign-only verification, one JSON state file.
+
+set -uo pipefail
+
+PKG0_VERSION="0.1.0"
+API="https://api.github.com"
+STATE_DIR="/var/lib/pkg0"
+STATE_FILE="$STATE_DIR/state.json"
+LOCK_FILE="$STATE_DIR/lock"
+CACHE_ROOT="/var/cache/pkg0"
+SELF_REPO="${PKG0_SELF_REPO:-martona/pkg0}"
+COSIGN_MIN="2.2.0"
+OIDC_ISSUER="https://token.actions.githubusercontent.com"
+
+EX_OK=0; EX_HARD=1; EX_USAGE=2; EX_HELD=3
+
+INTERACTIVE=0
+NONINT=0
+NO_ATTEST=0
+PURGE_CACHE=0
+ANY_HELD=0
+ANY_FAILED=0
+COSIGN=""
+COSIGN_VER=""
+COSIGN_OFFERED=0
+ARCH="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
+TMP=""
+
+# ---------------------------------------------------------------- utilities
+
+say()       { printf '%s\n' "$*"; }
+warn()      { printf 'pkg0: warning: %s\n' "$*" >&2; }
+err()       { printf 'pkg0: error: %s\n' "$*" >&2; }
+die()       { err "$*"; exit "$EX_HARD"; }
+die_usage() { err "$*"; exit "$EX_USAGE"; }
+
+cleanup() { [ -n "$TMP" ] && rm -rf "$TMP"; }
+
+human_size() { numfmt --to=iec "${1:-0}" 2>/dev/null || printf '%sB' "${1:-?}"; }
+
+# shellcheck disable=SC2016  # single quotes are the point: sed pattern, not expansion
+regex_escape() { printf '%s' "$1" | sed -e 's/[][\\.|$(){}?+*^]/\\&/g'; }
+
+now_iso() { date -u +%FT%TZ; }
+
+need_cmds() {
+    local c
+    for c in "$@"; do
+        command -v "$c" >/dev/null 2>&1 || die "missing dependency: $c"
+    done
+}
+
+# ---------------------------------------------------------------- state
+
+state_read() { if [ -s "$STATE_FILE" ]; then cat "$STATE_FILE"; else printf '[]'; fi; }
+
+state_write() {  # stdin: full new state
+    local tmp
+    tmp=$(mktemp "$STATE_DIR/.state.XXXXXX") || die "mktemp failed in $STATE_DIR"
+    if ! jq '.' >"$tmp" 2>/dev/null; then
+        rm -f "$tmp"
+        die "refusing to write corrupt state"
+    fi
+    chmod 0644 "$tmp"
+    mv "$tmp" "$STATE_FILE"
+}
+
+# identity: (repo, pkg_name) reconciles first, then (repo, glob); else append
+state_upsert() {  # $1: entry json
+    state_read | jq --argjson e "$1" '
+        [ .[] | select( ((.repo == $e.repo) and
+                         ((.pkg_name == $e.pkg_name) or (.glob == $e.glob))) | not ) ] + [ $e ]
+    ' | state_write
+}
+
+state_delete() {  # $1: repo  $2: pkg_name
+    state_read | jq --arg r "$1" --arg p "$2" \
+        '[ .[] | select((.repo == $r and .pkg_name == $p) | not) ]' | state_write
+}
+
+find_entries_by_name() {  # $1: name → matching entries, compact, one per line
+    state_read | jq -c --arg n "$1" \
+        '.[] | select(.pkg_name == $n or .repo == $n or ((.repo | split("/"))[1] == $n))'
+}
+
+# ---------------------------------------------------------------- http
+
+# gh_get URL [ETAG] → R_HTTP, R_BODY (file), R_ETAG
+gh_get() {
+    local url="$1" etag="${2:-}"
+    local hdrs="$TMP/hdrs" body
+    body=$(mktemp "$TMP/body.XXXXXX")
+    local -a args=(-sS -L -D "$hdrs" -o "$body" -w '%{http_code}'
+                   -H 'Accept: application/vnd.github+json'
+                   -H 'X-GitHub-Api-Version: 2022-11-28')
+    [ -n "$etag" ] && args+=(-H "If-None-Match: $etag")
+    R_HTTP=$(curl "${args[@]}" "$url") || { R_HTTP=000; R_BODY=""; R_ETAG=""; return 1; }
+    R_BODY=$body
+    R_ETAG=$(awk 'tolower($1)=="etag:"{v=$2} END{if (v) print v}' "$hdrs" | tr -d '\r')
+    return 0
+}
+
+# discover REPO [TAG] [ETAG] → R_DISCOVER=OK|UP_TO_DATE|NOT_FOUND|RATE_LIMITED|ERROR
+#                              R_RELEASE (file), R_ETAG, R_TAGNAME
+discover() {
+    local repo="$1" tag="${2:-}" etag="${3:-}" url
+    if [ -n "$tag" ]; then
+        url="$API/repos/$repo/releases/tags/$tag"
+    else
+        url="$API/repos/$repo/releases/latest"
+    fi
+    gh_get "$url" "$etag" || { R_DISCOVER=ERROR; return; }
+    case "$R_HTTP" in
+        200)     R_DISCOVER=OK
+                 R_RELEASE=$R_BODY
+                 R_TAGNAME=$(jq -r '.tag_name // ""' "$R_BODY" 2>/dev/null) ;;
+        304)     R_DISCOVER=UP_TO_DATE ;;
+        404)     R_DISCOVER=NOT_FOUND ;;
+        403|429) R_DISCOVER=RATE_LIMITED ;;
+        *)       R_DISCOVER=ERROR ;;
+    esac
+}
+
+# ---------------------------------------------------------------- assets & globs
+
+deb_assets() {  # $1: release file → tsv: name url digest size
+    jq -r '.assets[] | select(.name | endswith(".deb"))
+           | [.name, .browser_download_url, (.digest // ""), (.size | tostring)] | @tsv' "$1"
+}
+
+glob_filter() {  # $1: release file  $2: glob → matching tsv lines
+    local name url digest size
+    while IFS=$'\t' read -r name url digest size; do
+        # shellcheck disable=SC2254
+        case "$name" in
+            $2) printf '%s\t%s\t%s\t%s\n' "$name" "$url" "$digest" "$size" ;;
+        esac
+    done < <(deb_assets "$1")
+}
+
+# pick_asset RELEASE [GLOB] → R_PICK=OK|AMBIGUOUS|NODEBS
+#   OK sets R_GLOB, R_ASSET_NAME, R_ASSET_URL, R_ASSET_DIGEST; R_MATCH_N always set
+pick_asset() {
+    local rel="$1" glob="${2:-}"
+    R_GLOB=""; R_ASSET_NAME=""; R_ASSET_URL=""; R_ASSET_DIGEST=""; R_MATCH_N=0
+    local all
+    all=$(deb_assets "$rel")
+    if [ -z "$all" ]; then R_PICK=NODEBS; return; fi
+    local -a rungs
+    if [ -n "$glob" ]; then
+        rungs=("$glob")
+    else
+        rungs=('*.deb' "*${ARCH}.deb")   # default ladder (§1.2)
+    fi
+    local g lines n
+    for g in "${rungs[@]}"; do
+        lines=$(glob_filter "$rel" "$g")
+        if [ -z "$lines" ]; then n=0; else n=$(printf '%s\n' "$lines" | wc -l); fi
+        R_MATCH_N=$n
+        if [ "$n" -eq 1 ]; then
+            IFS=$'\t' read -r R_ASSET_NAME R_ASSET_URL R_ASSET_DIGEST _ <<<"$lines"
+            R_GLOB="$g"
+            R_PICK=OK
+            return
+        fi
+    done
+    R_PICK=AMBIGUOUS
+}
+
+generalize_glob() {  # $1: asset name  $2: tag → suggestion
+    local g="$1" t="${2:-}" t2="${2#v}"
+    [ -n "$t" ]  && g=${g//"$t"/'*'}
+    [ -n "$t2" ] && [ "$t2" != "$t" ] && g=${g//"$t2"/'*'}
+    while [[ "$g" == *'**'* ]]; do g=${g//'**'/'*'}; done
+    printf '%s' "$g"
+}
+
+# resolve_interactive RELEASE TAG → 0 with R_GLOB/R_ASSET_* set, 1 on user abort
+resolve_interactive() {
+    local rel="$1" tag="${2:-}"
+    local -a names urls digests
+    local name url digest size i=0
+    say ""
+    say "release ${tag:-latest}: the glob didn't isolate one .deb; assets available:"
+    while IFS=$'\t' read -r name url digest size; do
+        names+=("$name"); urls+=("$url"); digests+=("$digest")
+        i=$((i+1))
+        printf '  %2d) %s  (%s)\n' "$i" "$name" "$(human_size "$size")"
+    done < <(deb_assets "$rel")
+    local pick
+    while :; do
+        read -r -p "pick an asset [1-$i], q to abort: " pick || return 1
+        [ "$pick" = q ] && return 1
+        [[ "$pick" =~ ^[0-9]+$ ]] && [ "$pick" -ge 1 ] && [ "$pick" -le "$i" ] && break
+    done
+    local chosen="${names[$((pick-1))]}"
+    local suggestion glob n lines
+    suggestion=$(generalize_glob "$chosen" "$tag")
+    while :; do
+        read -e -r -i "$suggestion" -p "glob to store (must match exactly 1): " glob || return 1
+        [ -z "$glob" ] && glob="$suggestion"
+        [ "$glob" = q ] && return 1
+        lines=$(glob_filter "$rel" "$glob")
+        if [ -z "$lines" ]; then n=0; else n=$(printf '%s\n' "$lines" | wc -l); fi
+        if [ "$n" -eq 1 ]; then
+            IFS=$'\t' read -r R_ASSET_NAME R_ASSET_URL R_ASSET_DIGEST _ <<<"$lines"
+            if [ "$R_ASSET_NAME" != "$chosen" ]; then
+                say "note: that glob matches '$R_ASSET_NAME', not the asset you picked; using the match."
+            fi
+            R_GLOB="$glob"
+            return 0
+        fi
+        say "glob matched $n assets; try again (q to abort)"
+        suggestion="$glob"
+    done
+}
+
+# ---------------------------------------------------------------- attestation
+
+find_verifier() {  # sets COSIGN, COSIGN_VER; returns 1 if absent/too old
+    COSIGN=$(command -v cosign 2>/dev/null) || { COSIGN=""; return 1; }
+    COSIGN_VER=$("$COSIGN" version 2>&1 | sed -n 's/^GitVersion:[[:space:]]*v\{0,1\}//p' | head -1)
+    if [ -z "$COSIGN_VER" ] || ! dpkg --compare-versions "$COSIGN_VER" ge "$COSIGN_MIN" 2>/dev/null; then
+        warn "cosign at $COSIGN is version '${COSIGN_VER:-unknown}' (< $COSIGN_MIN); treating as absent"
+        COSIGN=""
+        return 1
+    fi
+    return 0
+}
+
+# raw snappy decode, stdin → stdout (GitHub serves bundle_url blobs snappy-compressed;
+# perl-base is Essential on every Debian/Ubuntu system, so this costs no dependency)
+snappy_decode() {
+    perl -e '
+        use strict; use warnings;
+        binmode STDIN; binmode STDOUT;
+        local $/; my $in = <STDIN>;
+        my ($pos, $len) = (0, length $in);
+        my ($ulen, $shift) = (0, 0);
+        while (1) {
+            die "truncated varint\n" if $pos >= $len;
+            my $b = ord substr $in, $pos++, 1;
+            $ulen |= ($b & 0x7f) << $shift;
+            last unless $b & 0x80;
+            $shift += 7;
+        }
+        my $out = "";
+        while ($pos < $len) {
+            my $tag = ord substr $in, $pos++, 1;
+            my $type = $tag & 3;
+            if ($type == 0) {                       # literal
+                my $l = $tag >> 2;
+                if ($l >= 60) {
+                    my $n = $l - 59; my $v = 0;
+                    for my $i (0 .. $n - 1) { $v |= (ord substr $in, $pos++, 1) << (8 * $i); }
+                    $l = $v;
+                }
+                $l += 1;
+                die "literal overrun\n" if $pos + $l > $len;
+                $out .= substr $in, $pos, $l; $pos += $l;
+            } else {                                # copy
+                my ($l, $off);
+                if ($type == 1) {
+                    $l = (($tag >> 2) & 7) + 4;
+                    $off = (($tag >> 5) << 8) | ord substr $in, $pos++, 1;
+                } elsif ($type == 2) {
+                    $l = ($tag >> 2) + 1;
+                    $off = (ord substr $in, $pos, 1) | ((ord substr $in, $pos + 1, 1) << 8);
+                    $pos += 2;
+                } else {
+                    $l = ($tag >> 2) + 1;
+                    $off = 0;
+                    for my $i (0 .. 3) { $off |= (ord substr $in, $pos + $i, 1) << (8 * $i); }
+                    $pos += 4;
+                }
+                die "bad copy offset\n" if $off <= 0 || $off > length $out;
+                my $base = length($out) - $off;
+                $out .= substr $out, $base + $_, 1 for 0 .. $l - 1;
+            }
+        }
+        die "length mismatch\n" unless length($out) == $ulen;
+        print $out;
+    '
+}
+
+# fetch_bundles REPO SHA256HEX → R_BUNDLES=FOUND|NONE|CHECKFAIL; bundle files $TMP/bundle.*.json
+# The API stopped inlining bundles: each attestation carries a short-lived bundle_url
+# pointing at a raw-snappy-compressed sigstore bundle. Handle both shapes.
+fetch_bundles() {
+    local repo="$1" digest="$2"
+    rm -f "$TMP"/bundle.*.json
+    gh_get "$API/repos/$repo/attestations/sha256:$digest" "" || { R_BUNDLES=CHECKFAIL; return; }
+    case "$R_HTTP" in
+        200) : ;;
+        404) R_BUNDLES=NONE; return ;;
+        403|429)
+            R_BUNDLES=CHECKFAIL
+            warn "couldn't check attestations for $repo (HTTP $R_HTTP — rate limit?)"
+            return ;;
+        *)  R_BUNDLES=CHECKFAIL
+            warn "attestation endpoint for $repo returned HTTP $R_HTTP"
+            return ;;
+    esac
+    local n
+    n=$(jq '.attestations | length' "$R_BODY" 2>/dev/null || echo 0)
+    if [ "${n:-0}" -eq 0 ]; then R_BUNDLES=NONE; return; fi
+    local i got=0 url blob out
+    for ((i = 0; i < n; i++)); do
+        out="$TMP/bundle.$i.json"
+        if jq -e ".attestations[$i].bundle | objects" "$R_BODY" >/dev/null 2>&1; then
+            jq -c ".attestations[$i].bundle" "$R_BODY" > "$out" && got=$((got + 1))
+            continue
+        fi
+        url=$(jq -r ".attestations[$i].bundle_url // empty" "$R_BODY")
+        [ -n "$url" ] || continue
+        blob="$TMP/blob.$i"
+        curl -fsSL -o "$blob" "$url" 2>/dev/null || { warn "bundle download failed (attestation $i)"; continue; }
+        if jq -e . "$blob" >/dev/null 2>&1; then
+            mv "$blob" "$out"; got=$((got + 1))
+        elif snappy_decode < "$blob" > "$out" 2>/dev/null && jq -e . "$out" >/dev/null 2>&1; then
+            rm -f "$blob"; got=$((got + 1))
+        else
+            rm -f "$blob" "$out"
+            warn "couldn't decode attestation bundle $i for $repo"
+        fi
+    done
+    if [ "$got" -gt 0 ]; then R_BUNDLES=FOUND; else R_BUNDLES=CHECKFAIL; fi
+}
+
+cosign_try() {  # $1: deb  $2: bundle  $3: identity regexp
+    # cosign 2.x needs --new-bundle-format for sigstore bundles; 3.x makes it the
+    # default and deprecates the flag (§5.1 flag drift)
+    local -a fmt=()
+    case "$COSIGN_VER" in 2.*) fmt=(--new-bundle-format) ;; esac
+    "$COSIGN" verify-blob-attestation "$1" \
+        --bundle "$2" "${fmt[@]}" \
+        --type slsaprovenance1 \
+        --certificate-oidc-issuer "$OIDC_ISSUER" \
+        --certificate-identity-regexp "$3" >/dev/null 2>&1
+}
+
+bundle_cert() {  # $1: bundle → DER cert on stdout
+    jq -r '.verificationMaterial.certificate.rawBytes
+           // .verificationMaterial.x509CertificateChain.certificates[0].rawBytes
+           // empty' "$1" 2>/dev/null | base64 -d 2>/dev/null
+}
+
+bundle_identity() {  # $1: bundle → cert SAN URI, or empty
+    bundle_cert "$1" \
+        | openssl x509 -inform der -noout -ext subjectAltName 2>/dev/null \
+        | grep -o 'URI:[^ ,]*' | head -1 | cut -d: -f2-
+}
+
+bundle_issuer() {  # $1: bundle → cert issuer string, or empty
+    bundle_cert "$1" | openssl x509 -inform der -noout -issuer 2>/dev/null | sed 's/^issuer=//'
+}
+
+# verify_deb DEB REPO [SIGNER] → R_VERIFY=VERIFIED|MISMATCH|INVALID; R_IDENTITY on MISMATCH
+verify_deb() {
+    local deb="$1" repo="$2" signer="${3:-}"
+    local re b
+    if [ -n "$signer" ] && [ "$signer" != null ]; then
+        re="^$(regex_escape "$signer")@"
+    else
+        re="^https://github\\.com/$(regex_escape "$repo")/\\.github/workflows/[^@]+@refs/tags/"
+    fi
+    for b in "$TMP"/bundle.*.json; do
+        [ -e "$b" ] || continue
+        cosign_try "$deb" "$b" "$re" && { R_VERIFY=VERIFIED; return; }
+    done
+    # signature may be fine under a different identity — distinguish mismatch from forgery
+    for b in "$TMP"/bundle.*.json; do
+        [ -e "$b" ] || continue
+        if cosign_try "$deb" "$b" '^https://'; then
+            R_IDENTITY=$(bundle_identity "$b")
+            R_VERIFY=MISMATCH
+            return
+        fi
+    done
+    # nothing verifies even permissively: forgery, or signed by a non-public Sigstore
+    # instance (e.g. GitHub's internal one, issuer "GitHub, Inc.") that the public
+    # trust root can't validate — those are unverifiable, not malicious
+    local issuer
+    for b in "$TMP"/bundle.*.json; do
+        [ -e "$b" ] || continue
+        issuer=$(bundle_issuer "$b")
+        case "$issuer" in
+            *sigstore.dev*) : ;;   # public instance and still failing → suspicious
+            "") : ;;
+            *) R_ISSUER="$issuer"; R_VERIFY=UNSUPPORTED; return ;;
+        esac
+    done
+    R_VERIFY=INVALID
+}
+
+mismatch_prompt() {  # $1: identity  $2: repo  $3: label → 0 trusted (sets R_SIGNER)
+    local id="$1" repo="$2" label="$3" ans
+    say ""
+    say "attestation found and cryptographically valid, but it was produced by:"
+    say "    $id"
+    say "pkg0 expected a workflow in $repo running from a tag."
+    say "This is normal for projects that release via a shared workflow or from a branch."
+    read -r -p "Trust this workflow identity for future updates of $label? [y/N] " ans || ans=n
+    case "$ans" in
+        y|Y|yes) R_SIGNER="${id%%@*}"; return 0 ;;
+        *)       return 1 ;;
+    esac
+}
+
+offer_cosign_bootstrap() {  # $1: repo being installed (skip self-offer)
+    [ "$COSIGN_OFFERED" = 1 ] && return
+    COSIGN_OFFERED=1
+    [ "$INTERACTIVE" = 1 ] || return
+    [ "$1" = "sigstore/cosign" ] && return
+    local ans
+    say "an attestation is published for this package, but no verifier (cosign) is installed."
+    read -r -p "install cosign now via 'pkg0 install sigstore/cosign'? [y/N] " ans || ans=n
+    case "$ans" in
+        y|Y|yes) install_one "sigstore/cosign" "" "" install "" \
+                     || warn "cosign bootstrap failed; continuing without a verifier" ;;
+    esac
+}
+
+# attest_gate DEB REPO MODE ATTEST SIGNER LABEL
+#   returns 0 proceed (R_ATTEST, R_SIGNER set), 1 abort, 2 hold (R_HOLD_MSG set)
+attest_gate() {
+    local deb="$1" repo="$2" mode="$3" attest="${4:-}" signer="${5:-}" label="$6"
+    R_SIGNER="$signer"
+    R_ATTEST="${attest:-none}"
+    if [ "$NO_ATTEST" = 1 ] && [ "$mode" = install ]; then
+        say "$label: attestation check skipped (--no-attest)"
+        R_ATTEST="opted-out"
+        return 0
+    fi
+    local digest
+    digest=$(sha256sum "$deb" | cut -d' ' -f1)
+    fetch_bundles "$repo" "$digest"
+    local bundles="$R_BUNDLES"
+    local have_verifier=0
+    find_verifier && have_verifier=1
+
+    case "$bundles" in
+        CHECKFAIL)
+            if [ "$attest" = required ]; then
+                R_HOLD_MSG="couldn't fetch attestation (transient?) and policy is 'required'"
+                return 2
+            fi
+            warn "$label: proceeding without attestation check (endpoint unavailable)"
+            return 0 ;;
+        NONE)
+            if [ "$attest" = required ]; then
+                err "$label: attestation REQUIRED but none is published for this artifact."
+                err "a previously-verified package losing its attestation is the attack signal pkg0 exists to raise. aborting."
+                return 1
+            fi
+            return 0 ;;
+    esac
+
+    # bundles FOUND
+    if [ "$have_verifier" = 0 ]; then
+        if [ "$attest" = required ]; then
+            R_HOLD_MSG="attestation-required but no verifier — run 'pkg0 install sigstore/cosign'"
+            return 2
+        fi
+        offer_cosign_bootstrap "$repo"
+        if ! find_verifier; then
+            warn "$label: attestation published but no verifier — installing anyway; run 'pkg0 install sigstore/cosign' to enable verification"
+            return 0
+        fi
+        fetch_bundles "$repo" "$digest"   # nested install clobbered $TMP/bundle.*
+        [ "$R_BUNDLES" = FOUND ] || { warn "$label: attestation re-fetch failed; installing unverified"; return 0; }
+    fi
+
+    verify_deb "$deb" "$repo" "$signer"
+    case "$R_VERIFY" in
+        VERIFIED)
+            say "✓ attestation verified ($repo)"
+            if [ "$mode" = update ] && [ "$attest" != required ]; then
+                say "$label: attestation now verifies — ratcheting policy to 'required'"
+            fi
+            R_ATTEST=required
+            return 0 ;;
+        MISMATCH)
+            local id="${R_IDENTITY:-<could not extract identity>}"
+            if [ "$INTERACTIVE" = 1 ]; then
+                if mismatch_prompt "$id" "$repo" "$label"; then
+                    verify_deb "$deb" "$repo" "$R_SIGNER"
+                    if [ "$R_VERIFY" = VERIFIED ]; then
+                        say "✓ attestation verified ($repo, trusted signer)"
+                        R_ATTEST=required
+                        return 0
+                    fi
+                    err "$label: verification still fails after trusting that signer"
+                    return 1
+                fi
+            fi
+            if [ "$attest" = required ]; then
+                R_HOLD_MSG="attestation signer mismatch ($id) — re-run 'pkg0 install $repo' interactively to review"
+                return 2
+            fi
+            if [ "$mode" = install ]; then
+                err "$label: attestation signer mismatch ($id); aborting (re-run interactively to review, or --no-attest)"
+                return 1
+            fi
+            warn "$label: attestation exists but the signer identity doesn't match ($id); policy left as-is"
+            return 0 ;;
+        UNSUPPORTED)
+            if [ "$attest" = required ]; then
+                R_HOLD_MSG="attestation signed by a non-public Sigstore instance (${R_ISSUER:-unknown issuer}); cosign can't verify it with the public trust root"
+                return 2
+            fi
+            warn "$label: attestation exists but is signed by a non-public Sigstore instance (${R_ISSUER:-unknown issuer}); can't verify — proceeding"
+            return 0 ;;
+        INVALID)
+            err "$label: attestation verification FAILED for $repo — the signature does not verify."
+            err "deleting the download; nothing was installed."
+            return 1 ;;
+    esac
+}
+
+# ---------------------------------------------------------------- fetch & dpkg shims
+
+fetch_asset() {  # $1: url  $2: name  $3: digest ("sha256:..." or "") → R_DEB
+    local url="$1" name="$2" digest="${3:-}"
+    local part="$TMP/$name.part"
+    if ! curl -fsSL --retry 2 -o "$part" "$url"; then
+        err "download failed: $url"
+        return 1
+    fi
+    mv "$part" "$TMP/$name"
+    R_DEB="$TMP/$name"
+    if [ -n "$digest" ]; then
+        local want="${digest#sha256:}" got
+        got=$(sha256sum "$R_DEB" | cut -d' ' -f1)
+        if [ "$got" != "$want" ]; then
+            err "digest mismatch for $name (expected $want, got $got)"
+            rm -f "$R_DEB"
+            return 1
+        fi
+    else
+        warn "release provides no digest for $name; skipping transport check"
+    fi
+    return 0
+}
+
+pkg_install_file() {  # $1: deb path — the backend shim (§6)
+    local -a opts=(-y -o DPkg::Lock::Timeout=60)
+    if [ "$INTERACTIVE" = 0 ]; then
+        DEBIAN_FRONTEND=noninteractive PKG0_LOCK_HELD=1 apt-get install "${opts[@]}" "$1"
+    else
+        PKG0_LOCK_HELD=1 apt-get install "${opts[@]}" "$1"
+    fi
+}
+
+pkg_remove_name() {  # $1: package name
+    PKG0_LOCK_HELD=1 apt-get remove -y -o DPkg::Lock::Timeout=60 "$1"
+}
+
+pkg_query_version() { dpkg-query -W -f '${Version}' "$1" 2>/dev/null || true; }
+
+prune_cache() {  # $1: cache dir — keep newest 3
+    # shellcheck disable=SC2012  # asset names are validated .deb filenames, ls -t is fine
+    ls -1t "$1"/*.deb 2>/dev/null | tail -n +4 | while IFS= read -r f; do rm -f -- "$f"; done
+}
+
+# ---------------------------------------------------------------- core engine
+
+# install_one REPO TAG GLOB_ARG MODE ENTRY_JSON
+#   MODE: install|update. Sets R_RESULT=INSTALLED|CURRENT|HELD|RETRY_LATER|FAILED|FAILED_USAGE
+#   INSTALLED sets R_OLD, R_NEW, R_PKG, R_ATTEST_FINAL; CURRENT sets R_CURR; HELD sets R_HOLD_MSG
+install_one() {
+    local repo="$1" tag="${2:-}" glob_arg="${3:-}" mode="$4" entry="${5:-}"
+    local stored_glob="" stored_etag="" stored_tag="" stored_digest="" stored_pkg=""
+    local attest="" signer="" label
+    if [ -n "$entry" ]; then
+        stored_glob=$(jq -r '.glob // ""' <<<"$entry")
+        stored_etag=$(jq -r '.etag // ""' <<<"$entry")
+        stored_tag=$(jq -r '.tag // ""' <<<"$entry")
+        stored_digest=$(jq -r '.asset_digest // ""' <<<"$entry")
+        stored_pkg=$(jq -r '.pkg_name // ""' <<<"$entry")
+        attest=$(jq -r '.attest // ""' <<<"$entry")
+        signer=$(jq -r '.signer // ""' <<<"$entry")
+        label="$stored_pkg"
+    else
+        label="${repo#*/}"
+    fi
+
+    _hold() {  # $1: message  $2: "resolve" to persist needs_resolve
+        R_RESULT=HELD
+        R_HOLD_MSG="$1"
+        if [ "${2:-}" = resolve ] && [ -n "$entry" ]; then
+            state_upsert "$(jq -c '.needs_resolve = true' <<<"$entry")"
+        fi
+    }
+
+    # -------- discovery
+    local etag=""
+    [ "$mode" = update ] && etag="$stored_etag"
+    discover "$repo" "$tag" "$etag"
+    case "$R_DISCOVER" in
+        UP_TO_DATE) R_RESULT=CURRENT; R_CURR=$(jq -r '.installed_ver // "?"' <<<"$entry"); return 0 ;;
+        NOT_FOUND)
+            if [ -n "$tag" ]; then err "$label: no release tagged '$tag' in $repo"
+            else err "$label: no releases found in $repo (missing repo, or private?)"; fi
+            R_RESULT=FAILED; return 1 ;;
+        RATE_LIMITED)
+            warn "$label: rate-limited by GitHub; skipping, no state change"
+            R_RESULT=RETRY_LATER; return 0 ;;
+        ERROR)
+            err "$label: discovery failed for $repo (network?)"
+            R_RESULT=FAILED; return 1 ;;
+    esac
+    local rel="$R_RELEASE" new_etag="$R_ETAG" rel_tag="$R_TAGNAME"
+
+    # -------- asset selection
+    local glob="${glob_arg:-$stored_glob}"
+    pick_asset "$rel" "$glob"
+    case "$R_PICK" in
+        NODEBS)
+            if [ "$mode" = update ]; then
+                if [ -n "$rel_tag" ] && [ "$rel_tag" != "$stored_tag" ]; then
+                    say "$label: release $rel_tag found, no debs yet; retrying next run"
+                    R_RESULT=RETRY_LATER; return 0
+                fi
+                _hold "release ${rel_tag:-?} has no .deb assets — upstream stopped shipping debs?" resolve
+                return 0
+            fi
+            err "$label: release ${rel_tag:-latest} of $repo contains no .deb assets"
+            R_RESULT=FAILED; return 1 ;;
+        AMBIGUOUS)
+            if [ "$INTERACTIVE" = 1 ]; then
+                if ! resolve_interactive "$rel" "$rel_tag"; then
+                    if [ "$mode" = update ]; then
+                        _hold "resolver aborted; glob matched $R_MATCH_N assets" resolve
+                        return 0
+                    fi
+                    err "$label: aborted"
+                    R_RESULT=FAILED_USAGE; return 1
+                fi
+                glob="$R_GLOB"
+            else
+                if [ "$mode" = update ]; then
+                    _hold "glob matched $R_MATCH_N assets; re-run 'pkg0 install $repo' interactively" resolve
+                    return 0
+                fi
+                err "$label: glob '${glob:-<default ladder>}' matched $R_MATCH_N .deb assets in $repo ${rel_tag:+($rel_tag)}; pass a more specific glob or run interactively"
+                R_RESULT=FAILED_USAGE; return 1
+            fi ;;
+        OK) glob="$R_GLOB" ;;
+    esac
+    local asset_name="$R_ASSET_NAME" asset_url="$R_ASSET_URL" asset_digest="$R_ASSET_DIGEST"
+
+    # -------- digest short-circuit (release edited, artifact unchanged)
+    if [ "$mode" = update ] && [ "$rel_tag" = "$stored_tag" ] \
+       && [ -n "$asset_digest" ] && [ "$asset_digest" = "$stored_digest" ]; then
+        state_upsert "$(jq -c --arg e "$new_etag" '.etag = $e' <<<"$entry")"
+        R_RESULT=CURRENT; R_CURR=$(jq -r '.installed_ver // "?"' <<<"$entry")
+        return 0
+    fi
+
+    # -------- fetch
+    if ! fetch_asset "$asset_url" "$asset_name" "$asset_digest"; then
+        R_RESULT=FAILED; return 1
+    fi
+    local deb="$R_DEB"
+
+    # -------- attestation gate — before anything parses the file (§6)
+    attest_gate "$deb" "$repo" "$mode" "$attest" "$signer" "$label"
+    case $? in
+        1) rm -f "$deb"; R_RESULT=FAILED; return 1 ;;
+        2) rm -f "$deb"; _hold "$R_HOLD_MSG"; return 0 ;;
+    esac
+    local new_attest="$R_ATTEST" new_signer="$R_SIGNER"
+
+    # -------- parse (only now)
+    local pkg ver
+    pkg=$(dpkg-deb -f "$deb" Package 2>/dev/null)
+    ver=$(dpkg-deb -f "$deb" Version 2>/dev/null)
+    if [ -z "$pkg" ] || [ -z "$ver" ]; then
+        err "$label: downloaded file is not a valid .deb"
+        rm -f "$deb"; R_RESULT=FAILED; return 1
+    fi
+    if ! [[ "$pkg" =~ ^[a-z0-9][a-z0-9+.-]+$ ]]; then
+        err "$label: suspicious package name '$pkg' in deb; aborting"
+        rm -f "$deb"; R_RESULT=FAILED; return 1
+    fi
+    if [ "$mode" = update ] && [ "$pkg" != "$stored_pkg" ]; then
+        rm -f "$deb"
+        _hold "asset resolves to package '$pkg' but this entry tracks '$stored_pkg' — glob drift; re-run 'pkg0 install $repo' interactively" resolve
+        return 0
+    fi
+
+    # -------- cache
+    local cache_dir="$CACHE_ROOT/$pkg" deb_path
+    mkdir -p "$cache_dir"
+    deb_path="$cache_dir/$asset_name"
+    mv "$deb" "$deb_path"
+
+    local pinned_json=false
+    [ "$mode" = install ] && [ -n "$tag" ] && pinned_json=true
+
+    _write_entry() {  # $1: installed_ver
+        state_upsert "$(jq -cn \
+            --arg repo "$repo" --arg glob "$glob" --arg pkg "$pkg" --arg ver "$1" \
+            --arg tag "$rel_tag" --arg an "$asset_name" --arg ad "$asset_digest" \
+            --arg etag "$new_etag" --arg attest "$new_attest" --arg signer "$new_signer" \
+            --argjson pinned "$pinned_json" --arg ts "$(now_iso)" '
+            {repo: $repo, glob: $glob, pkg_name: $pkg, installed_ver: $ver, tag: $tag,
+             asset_name: $an,
+             asset_digest: (if $ad == "" then null else $ad end),
+             etag:         (if $etag == "" then null else $etag end),
+             attest: $attest,
+             signer: (if $signer == "" or $signer == "null" then null else $signer end),
+             pinned: $pinned, needs_resolve: false, installed_at: $ts}')"
+    }
+
+    # -------- version compare (§4) — never against tags
+    local curr
+    curr=$(pkg_query_version "$pkg")
+    if [ -n "$curr" ] && dpkg --compare-versions "$ver" le "$curr" 2>/dev/null; then
+        _write_entry "$curr"
+        prune_cache "$cache_dir"
+        R_RESULT=CURRENT; R_CURR="$curr"
+        return 0
+    fi
+
+    # -------- install
+    if ! pkg_install_file "$deb_path"; then
+        err "$label: apt-get failed; state untouched, deb kept at $deb_path"
+        R_RESULT=FAILED; return 1
+    fi
+
+    # -------- cosign TOFU note + retro-verify (§5.4)
+    if [ "$pkg" = cosign ] && [ "$new_attest" != required ] && [ "$NO_ATTEST" != 1 ]; then
+        say ""
+        say "NOTE: this cosign install was trust-on-first-use — nothing existed yet to verify it."
+        say "      every subsequent cosign update is verified by this binary; the ratchet starts here."
+        if find_verifier; then
+            local self_digest
+            self_digest=$(sha256sum "$deb_path" | cut -d' ' -f1)
+            fetch_bundles "$repo" "$self_digest"
+            if [ "$R_BUNDLES" = FOUND ]; then
+                verify_deb "$deb_path" "$repo" "$new_signer"
+                if [ "$R_VERIFY" = VERIFIED ]; then
+                    say "✓ retro-verified the cosign deb with the freshly installed cosign"
+                    say "  (a compromised binary could lie about its own verification — this catches"
+                    say "   corruption and non-targeted tampering, not a determined attacker)"
+                    new_attest=required
+                fi
+            fi
+        fi
+    fi
+
+    _write_entry "$ver"
+    prune_cache "$cache_dir"
+    R_RESULT=INSTALLED; R_OLD="${curr:-}"; R_NEW="$ver"; R_PKG="$pkg"; R_ATTEST_FINAL="$new_attest"
+    return 0
+}
+
+# ---------------------------------------------------------------- commands
+
+cmd_install() {
+    [ $# -ge 1 ] || die_usage "usage: pkg0 install <owner>/<repo>[@<tag>] [<glob>] [--no-attest]"
+    local spec="$1" glob="${2:-}"
+    [ $# -le 2 ] || die_usage "too many arguments"
+
+    [[ "$spec" =~ ^([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)(@(.+))?$ ]] \
+        || die_usage "bad repospec '$spec' (expected owner/repo[@tag])"
+    local repo="${BASH_REMATCH[1]}" tag="${BASH_REMATCH[3]:-}"
+
+    # shell-expansion guard (§1.5)
+    if [ -n "$glob" ] && [[ "$glob" != *[\*\?\[]* ]] && [ -e "$glob" ]; then
+        die_usage "argument '$glob' looks like a shell-expanded local file — quote your glob"
+    fi
+
+    # reuse the stored entry when this repo already has exactly one (reinstall/unpin path)
+    local entry="" n
+    n=$(state_read | jq --arg r "$repo" '[.[] | select(.repo == $r)] | length')
+    if [ "$n" -eq 1 ]; then
+        entry=$(state_read | jq -c --arg r "$repo" '[.[] | select(.repo == $r)][0]')
+    elif [ "$n" -gt 1 ] && [ -z "$glob" ]; then
+        die_usage "multiple packages are installed from $repo; pass a glob to say which"
+    fi
+
+    install_one "$repo" "$tag" "$glob" install "$entry"
+    case "$R_RESULT" in
+        INSTALLED)
+            say "installed: $R_PKG $R_NEW${R_OLD:+ (was $R_OLD)}${tag:+ [pinned @$tag]}" ;;
+        CURRENT)
+            say "${entry:+re-registered: }already current (installed version $R_CURR); state updated" ;;
+        RETRY_LATER)  exit "$EX_HARD" ;;
+        FAILED)       exit "$EX_HARD" ;;
+        FAILED_USAGE) exit "$EX_USAGE" ;;
+        HELD)         err "held: $R_HOLD_MSG"; exit "$EX_HARD" ;;
+    esac
+}
+
+update_line() {  # $1: name  $2: rest
+    printf '%-16s %s\n' "$1" "$2"
+}
+
+cmd_update() {
+    local -a targets=()
+    if [ $# -gt 0 ]; then
+        local name matches
+        for name in "$@"; do
+            matches=$(find_entries_by_name "$name")
+            if [ -z "$matches" ]; then
+                die_usage "no package matches '$name' (try 'pkg0 list')"
+            fi
+            if [ "$(printf '%s\n' "$matches" | wc -l)" -gt 1 ]; then
+                err "'$name' is ambiguous:"
+                printf '%s\n' "$matches" | jq -r '"  " + .pkg_name + "  (" + .repo + ", glob " + .glob + ")"' >&2
+                exit "$EX_USAGE"
+            fi
+            targets+=("$matches")
+        done
+    else
+        local line
+        while IFS= read -r line; do
+            [ -n "$line" ] && targets+=("$line")
+        done < <(state_read | jq -c '.[]')
+    fi
+    if [ "${#targets[@]}" -eq 0 ]; then
+        say "nothing to update (no packages registered; try 'pkg0 install owner/repo')"
+        return
+    fi
+
+    local entry name pinned tag_pin
+    for entry in "${targets[@]}"; do
+        name=$(jq -r '.pkg_name' <<<"$entry")
+        pinned=$(jq -r '.pinned' <<<"$entry")
+        if [ "$pinned" = true ]; then
+            tag_pin=$(jq -r '.tag // "?"' <<<"$entry")
+            update_line "$name" "$(jq -r '.installed_ver // "?"' <<<"$entry") (pinned @$tag_pin — skipped)"
+            continue
+        fi
+        install_one "$(jq -r '.repo' <<<"$entry")" "" "" update "$entry"
+        case "$R_RESULT" in
+            INSTALLED)
+                local mark=""
+                [ "$R_ATTEST_FINAL" = required ] && mark="  ✓ attested"
+                update_line "$name" "${R_OLD:-<none>} → $R_NEW$mark" ;;
+            CURRENT)     update_line "$name" "$R_CURR (current)" ;;
+            HELD)        update_line "$name" "HELD — $R_HOLD_MSG"; ANY_HELD=1 ;;
+            RETRY_LATER) : ;;
+            FAILED|FAILED_USAGE)
+                update_line "$name" "FAILED (see above)"; ANY_FAILED=1 ;;
+        esac
+    done
+
+    [ "$ANY_FAILED" = 1 ] && exit "$EX_HARD"
+    [ "$ANY_HELD" = 1 ] && exit "$EX_HELD"
+    exit "$EX_OK"
+}
+
+cmd_remove() {
+    [ $# -eq 1 ] || die_usage "usage: pkg0 remove <name> [--purge-cache]"
+    local name="$1" matches
+    matches=$(find_entries_by_name "$name")
+    [ -n "$matches" ] || die_usage "no package matches '$name' (try 'pkg0 list')"
+    if [ "$(printf '%s\n' "$matches" | wc -l)" -gt 1 ]; then
+        err "'$name' is ambiguous:"
+        printf '%s\n' "$matches" | jq -r '"  " + .pkg_name + "  (" + .repo + ")"' >&2
+        exit "$EX_USAGE"
+    fi
+    local pkg repo
+    pkg=$(jq -r '.pkg_name' <<<"$matches")
+    repo=$(jq -r '.repo' <<<"$matches")
+
+    if [ "$pkg" = pkg0 ]; then
+        if [ "$INTERACTIVE" = 1 ]; then
+            local ans
+            read -r -p "removing pkg0 with pkg0; state and cache will be orphaned. continue? [y/N] " ans || ans=n
+            case "$ans" in y|Y|yes) : ;; *) say "aborted"; return ;; esac
+        else
+            die "refusing to remove pkg0 non-interactively (it works, but it's rarely what anyone means)"
+        fi
+    fi
+
+    pkg_remove_name "$pkg" || die "apt-get remove failed for $pkg"
+    state_delete "$repo" "$pkg"
+    if [ "$PURGE_CACHE" = 1 ]; then
+        rm -rf "${CACHE_ROOT:?}/$pkg"
+        say "removed: $pkg (cache purged)"
+    else
+        say "removed: $pkg (cache kept at $CACHE_ROOT/$pkg)"
+    fi
+}
+
+cmd_list() {
+    if [ ! -s "$STATE_FILE" ]; then
+        say "no packages registered (state: $STATE_FILE)"
+        return
+    fi
+    printf '%-16s %-18s %-14s %-10s %-6s %s\n' NAME VERSION TAG ATTEST FLAGS REPO
+    state_read | jq -r '.[] |
+        [.pkg_name,
+         (.installed_ver // "?"),
+         (.tag // "-"),
+         (.attest // "none"),
+         ((if .pinned then "pin " else "" end) + (if .needs_resolve then "HELD" else "" end)
+          | if . == "" then "-" else . end),
+         .repo] | @tsv' \
+    | while IFS=$'\t' read -r n v t a f r; do
+        printf '%-16s %-18s %-14s %-10s %-6s %s\n' "$n" "$v" "$t" "$a" "$f" "$r"
+    done
+}
+
+usage() {
+    cat <<EOF
+pkg0 $PKG0_VERSION — sidecar package manager for .debs published via GitHub Releases
+
+usage:
+  pkg0 install <owner>/<repo>[@<tag>] [<glob>] [--no-attest]
+  pkg0 update  [<name>...] [--non-interactive]
+  pkg0 remove  <name> [--purge-cache]
+  pkg0 selfupdate                  # sugar for: pkg0 update pkg0
+  pkg0 list
+
+exit codes: 0 ok · 1 hard failure · 2 usage · 3 completed but >=1 package HELD
+state: $STATE_FILE   cache: $CACHE_ROOT
+EOF
+}
+
+# ---------------------------------------------------------------- main
+
+need_root() { [ "$(id -u)" = 0 ] || die "root required for '$1' (try sudo)"; }
+
+acquire_lock() {
+    # PKG0_LOCK_HELD=1 means an ancestor pkg0 already holds the lock (postinst handshake, §7.5)
+    [ "${PKG0_LOCK_HELD:-}" = 1 ] && return
+    mkdir -p "$STATE_DIR" "$CACHE_ROOT"
+    exec 9>>"$LOCK_FILE"
+    flock -w 60 9 || die "another pkg0 run holds the lock ($LOCK_FILE)"
+}
+
+main() {
+    local verb="${1:-help}"
+    [ $# -gt 0 ] && shift
+    local -a pos=()
+    local a
+    for a in "$@"; do
+        case "$a" in
+            --non-interactive) NONINT=1 ;;
+            --no-attest)       NO_ATTEST=1 ;;
+            --purge-cache)     PURGE_CACHE=1 ;;
+            -h|--help)         verb=help ;;
+            -*)                die_usage "unknown flag: $a" ;;
+            *)                 pos+=("$a") ;;
+        esac
+    done
+
+    INTERACTIVE=0
+    [ -t 0 ] && [ "$NONINT" = 0 ] && INTERACTIVE=1
+
+    TMP=$(mktemp -d) || die "mktemp failed"
+    trap cleanup EXIT
+
+    case "$verb" in
+        install|update|remove|selfupdate)
+            need_cmds curl jq dpkg dpkg-deb apt-get flock sha256sum
+            need_root "$verb"
+            acquire_lock
+            ;;
+        list|help|version|--version) : ;;
+        *) usage; exit "$EX_USAGE" ;;
+    esac
+
+    case "$verb" in
+        install)     cmd_install "${pos[@]}" ;;
+        update)      cmd_update ${pos[@]+"${pos[@]}"} ;;
+        selfupdate)
+            if [ -z "$(find_entries_by_name pkg0)" ]; then
+                die "pkg0 isn't registered in its own state (manual install?) — run: pkg0 install $SELF_REPO"
+            fi
+            cmd_update pkg0 ;;
+        remove)      cmd_remove ${pos[@]+"${pos[@]}"} ;;
+        list)        cmd_list ;;
+        version|--version) say "pkg0 $PKG0_VERSION" ;;
+        help)        usage ;;
+    esac
+}
+
+main "$@"

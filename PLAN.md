@@ -202,9 +202,11 @@ for. In v3 gh plays no role in pkg0 at all — not even discovery.
 ### 5.1 Verifier availability
 
 1. `cosign` on PATH (distro package: Ubuntu 26.04 ships 2.6.x; **24.04 does not**), **subject to
-   a minimum-version check** — `--new-bundle-format` and `--type slsaprovenance1` behavior drift
-   across 2.x releases; pin the floor during implementation and check `cosign version` output.
-   Too old → treat as absent (and say why).
+   a minimum-version check** (floor: 2.2.0; check `cosign version` output). Flag drift is real
+   and confirmed: **cosign 3.x makes the sigstore bundle format the default and deprecates
+   `--new-bundle-format`** (passing it still works but warns); 2.x requires the flag. pkg0
+   detects the major version and passes the flag only on 2.x. Too old → treat as absent (and
+   say why).
 2. Else a pkg0-managed cosign (§5.4).
 3. Else: verifier absent → right-hand column of the policy matrix (§5.3).
 
@@ -216,18 +218,39 @@ curl, and the Sigstore trusted root comes from Sigstore's own TUF infra (fetched
 
 ```sh
 DIGEST=$(sha256sum "$DEB" | cut -d' ' -f1)
-curl -fsS "https://api.github.com/repos/$REPO/attestations/sha256:$DIGEST" \
-  | jq -c '.attestations[].bundle' > bundles.jsonl
-# 404/empty → no attestation published
+curl -fsS "https://api.github.com/repos/$REPO/attestations/sha256:$DIGEST"
+# 404 / empty attestations[] → none published
+```
 
+**Bundles are no longer inline.** The API now returns, per attestation, a `bundle_url`
+(short-lived signed blob URL) and `bundle: null`; the blob it serves is **raw-snappy-compressed**
+sigstore-bundle JSON (undocumented — confirmed against cli/cli, and it's what gh itself does:
+`snappy.Decode` unconditionally). pkg0 handles both shapes: inline bundle if present, else fetch
+`bundle_url` and decompress. Raw snappy is ~30 lines of perl, and `perl-base` is Essential on
+every deb system — zero added dependencies.
+
+```sh
 # for each bundle (repos may publish several: provenance, SBOM, ...):
 cosign verify-blob-attestation "$DEB" \
-  --bundle bundle.json --new-bundle-format \
+  --bundle bundle.json \
   --type slsaprovenance1 \
   --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
   --certificate-identity-regexp "$IDENTITY_RE"
+# + --new-bundle-format on cosign 2.x only (§5.1)
 # pass = at least one SLSA-provenance bundle verifies
 ```
+
+**Verdict classes** (what verify can conclude, and what each means):
+- **VERIFIED** — some bundle verifies under the expected identity.
+- **MISMATCH** — a bundle verifies under a permissive identity but not the expected one:
+  genuine signature, different workflow → trust prompt below.
+- **UNSUPPORTED** — no bundle chains to the public Sigstore root **and** a cert names a
+  non-`sigstore.dev` issuer. Confirmed in the wild: GitHub signs some artifacts (cli/cli's debs
+  among them) with its *internal* Sigstore instance (issuer "GitHub, Inc.", no Rekor entry,
+  RFC3161 timestamp only) — unverifiable with the public trust root, **not malicious**. Warn and
+  proceed; under `attest: required` → HOLD, never a scream.
+- **INVALID** — a public-instance bundle that still fails → forgery/corruption → abort, scream,
+  delete the download.
 
 **Identity regexp — derived, never user-written.** The cert's SAN names the *workflow identity*
 (`https://github.com/o/r/.github/workflows/x.yml@refs/tags/v1.2.3`), and every GitHub Actions
@@ -245,7 +268,8 @@ unescaped dots, missing scheme anchor.
 **Identity mismatch — trust prompt, in plain language.** The derived regexp fails on *genuine*
 attestations in two known-legitimate shapes: releases built by a **reusable workflow** (the SAN
 names the shared workflow's repo, not upstream's) and workflows released **from a branch**
-(e.g. `workflow_dispatch` from main → `@refs/heads/main`). When the signature is valid but the
+(e.g. `workflow_dispatch` from main → `@refs/heads/main`; confirmed in the wild — cli/cli
+releases from `deployment.yml@refs/heads/trunk`). When the signature is valid but the
 identity doesn't match, pkg0 must not just say "verification failed" — it says exactly what
 happened, so the trust decision the user is making is unmistakable:
 
@@ -257,7 +281,8 @@ This is normal for projects that release via a shared workflow or from a branch.
 Trust this exact identity for future updates of clipp? [y/N]
 ```
 
-Accept → persist as `signer` in state; subsequent verifies match against it exactly.
+Accept → persist as `signer` in state (the workflow path, i.e. the identity up to the `@` —
+the ref after it changes per release); subsequent verifies match `^<signer>@`.
 Non-interactive → HOLD with the same message.
 
 ### 5.3 Policy matrix
@@ -414,6 +439,10 @@ package it manages. So self-management is not a special subsystem; it's **one mo
 - [ ] Identity mismatch (reusable workflow, branch ref) → plain-language trust prompt, persist
       `signer`; non-interactive → HOLD
 - [ ] Attestation endpoint 404 vs rate-limit 403 → distinguish: "none published" vs "couldn't check"
+- [ ] `bundle_url` blob is raw-snappy → embedded perl decoder; inline bundle still handled if present
+- [ ] Attestation signed by a non-public Sigstore instance (GitHub internal) → UNSUPPORTED:
+      warn & proceed / HOLD under required — never treated as forgery
+- [ ] Wrong-arch deb chosen anyway (resolver override) → apt rejects; state untouched, deb kept
 
 ---
 

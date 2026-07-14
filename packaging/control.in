@@ -1,0 +1,13 @@
+Package: pkg0
+Version: __VERSION__
+Section: admin
+Priority: optional
+Architecture: all
+Depends: bash (>= 5.0), curl, jq, ca-certificates, openssl
+Recommends: cosign
+Maintainer: martona <amarton@gmail.com>
+Description: sidecar package manager for .debs published on GitHub Releases
+ Installs and updates .deb packages straight from GitHub Releases,
+ with Sigstore attestation verification via cosign. Invoked separately
+ from apt and never touches apt's own inventory; one JSON state file,
+ one bash script.
