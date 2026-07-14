@@ -7,16 +7,34 @@ git tag v0.1.0
 git push --tags
 ```
 
-`release-tag.yml` fires: builds `pkg0_0.1.0_all.deb`, smoke-tests it (install, postinst
-seeding, exit codes, no-clobber reinstall), attests it with `actions/attest-build-provenance`,
-**verifies the attestation is live** via `gh attestation verify`, and creates a **draft**
-release. Review, then publish via the UI or:
+`release-tag.yml` fires: builds the deb, smoke-tests it (install, postinst seeding, exit
+codes, no-clobber reinstall, seeded-glob-matches-asset), attests it with
+`actions/attest-build-provenance`, **verifies the attestation is live** via
+`gh attestation verify`, and creates a **draft** release. Review, then publish via the UI or:
 
 ```sh
 gh release edit v0.1.0 --draft=false
 ```
 
 Publishing the draft is what makes it visible to `releases/latest` — i.e. to pkg0 clients.
+
+## Release assets
+
+Every release ships exactly two assets, both under **stable, version-less names** so
+`releases/latest/download/<name>` URLs never change (the version lives in the deb's control
+file and `pkg0 version`):
+
+- `pkg0_latest_all.deb` — the package. The name deliberately keeps the `pkg0_*_all.deb`
+  shape: that is `SELF_GLOB` in `packaging/postinst` — the glob every install since v0.0.2
+  carries in its state — so existing installs selfupdate across the rename from the old
+  versioned asset names. It must also match the filename in `scripts/install.sh`; the
+  release smoke test asserts the glob↔asset match, so a rename can't silently brick
+  selfupdate.
+- `install.sh` — the bootstrap installer, so
+  `curl -fsSL https://github.com/martona/pkg0/releases/latest/download/install.sh | bash`
+  always installs the latest release.
+
+Both assets are attested and both attestations are verified before the release is created.
 
 ## Attestation identity
 

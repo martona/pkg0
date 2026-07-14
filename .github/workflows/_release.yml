@@ -46,21 +46,31 @@ jobs:
           set -euo pipefail
           sudo apt-get update -qq
           sudo apt-get install -y -qq shellcheck
-          bash -n pkg0
-          shellcheck -x pkg0 packaging/build-deb.sh packaging/postinst
+          bash -n pkg0 scripts/install.sh
+          shellcheck -x pkg0 packaging/build-deb.sh packaging/postinst scripts/install.sh
 
       - name: Build deb
         run: |
           set -euo pipefail
           sh packaging/build-deb.sh "${{ inputs.version }}" "$GITHUB_REPOSITORY"
           mkdir -p dist
-          mv "pkg0_${{ inputs.version }}_all.deb" dist/
-          dpkg-deb -I dist/*.deb
+          # Version-LESS canonical asset name for a stable releases/latest/download
+          # URL (the version still lives in the control file and `pkg0 version`).
+          # The name deliberately keeps the pkg0_*_all.deb shape: that's the glob
+          # postinst has seeded into every install's state since v0.0.2, so existing
+          # installs selfupdate right across the rename. Must stay in sync with
+          # SELF_GLOB in packaging/postinst and the asset name in scripts/install.sh
+          # — the smoke test below asserts the former.
+          mv "pkg0_${{ inputs.version }}_all.deb" dist/pkg0_latest_all.deb
+          # The one-line `curl ... | bash` installer, shipped at the equally stable
+          # releases/latest/download/install.sh URL.
+          cp scripts/install.sh dist/install.sh
+          dpkg-deb -I dist/pkg0_latest_all.deb
 
       - name: Smoke test
         run: |
           set -euxo pipefail
-          sudo apt-get install -y ./dist/pkg0_*.deb
+          sudo apt-get install -y ./dist/pkg0_latest_all.deb
 
           # version stamped into the script
           pkg0 version | grep -F "${{ inputs.version }}"
@@ -69,6 +79,15 @@ jobs:
           jq -e --arg r "$GITHUB_REPOSITORY" \
             '.[] | select(.pkg_name == "pkg0" and .repo == $r and .attest == "required")' \
             /var/lib/pkg0/state.json
+
+          # the seeded glob must match the asset name this release actually ships —
+          # a rename that breaks this would leave every install HELD on selfupdate
+          glob=$(jq -r '.[] | select(.pkg_name == "pkg0").glob' /var/lib/pkg0/state.json)
+          # $glob is unquoted on purpose: fnmatch semantics, same engine pkg0 uses
+          case "pkg0_latest_all.deb" in
+            $glob) ;;
+            *) echo "::error::seeded glob '$glob' does not match shipped asset 'pkg0_latest_all.deb'"; exit 1 ;;
+          esac
 
           # state is root-owned 0644 (unprivileged list must read it)
           [ "$(stat -c '%a %U' /var/lib/pkg0/state.json)" = "644 root" ]
@@ -87,16 +106,16 @@ jobs:
 
           # reinstall must not clobber the seeded state entry
           ts1=$(jq -r '.[] | select(.pkg_name == "pkg0").installed_at' /var/lib/pkg0/state.json)
-          sudo apt-get install -y --reinstall ./dist/pkg0_*.deb
+          sudo apt-get install -y --reinstall ./dist/pkg0_latest_all.deb
           ts2=$(jq -r '.[] | select(.pkg_name == "pkg0").installed_at' /var/lib/pkg0/state.json)
           [ "$ts1" = "$ts2" ]
 
           sudo apt-get remove -y pkg0
 
-      - name: Upload artifact
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: deb
+          name: release-assets
           path: dist/*
           if-no-files-found: error
           retention-days: 1
@@ -115,16 +134,19 @@ jobs:
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v3
         with:
-          subject-path: 'dist/*.deb'
+          subject-path: 'dist/*'
 
       - name: Verify attestation is live
         # pkg0 clients (and pkg0's own selfupdate) depend on this attestation being
         # fetchable and valid — prove it against the real API before releasing.
+        # install.sh rides along: everything in the release is attested and checked.
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          gh attestation verify dist/pkg0_*.deb --repo "$GITHUB_REPOSITORY"
+          for f in dist/*; do
+            gh attestation verify "$f" --repo "$GITHUB_REPOSITORY"
+          done
 
       - name: Create release
         uses: softprops/action-gh-release@v2

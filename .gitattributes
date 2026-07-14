@@ -1,0 +1,5 @@
+# Line-ending policy: LF-canonical. Everything in this repo ships to or runs on
+# Linux (pkg0 itself, packaging/postinst, scripts/install.sh — all bash/sh, and
+# CRLF breaks a shebang). eol=lf overrides core.autocrlf=true on Windows checkouts
+# so the working tree always matches the LF blobs.
+* text=auto eol=lf

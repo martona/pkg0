@@ -8,6 +8,9 @@ STATE_DIR=/var/lib/pkg0
 STATE="$STATE_DIR/state.json"
 LOCK="$STATE_DIR/lock"
 SELF_REPO="__SELF_REPO__"
+# matches both the stable release asset name (pkg0_latest_all.deb) and the
+# versioned pkg0_<ver>_all.deb assets of releases <= v0.0.3, so selfupdate keeps
+# working across the rename; _release.yml smoke-asserts the shipped name matches
 SELF_GLOB="pkg0_*_all.deb"
 
 seed() {

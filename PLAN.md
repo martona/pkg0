@@ -394,8 +394,14 @@ package it manages. So self-management is not a special subsystem; it's **one mo
 - **Guard:** `pkg0 remove pkg0` prompts for confirmation ("removing pkg0 with pkg0; state and
   cache will be orphaned") rather than refusing — it works fine mechanically (same inode
   argument), it's just rarely what anyone means.
-- **Bootstrap:** first-ever install is manual by design — download the release deb once,
-  `apt-get install ./pkg0_*.deb`, and postinst takes it from there. No curl-pipe-bash installer.
+- **Bootstrap:** trust-on-first-use — the first install isn't verified by pkg0 (nothing exists
+  yet to verify it), and postinst takes it from there. Two equivalent paths: the shipped
+  installer (`curl -fsSL .../releases/latest/download/install.sh | bash`), or manually
+  downloading the release deb and `apt-get install ./pkg0_latest_all.deb`. The release
+  publishes the deb under the stable version-less asset name `pkg0_latest_all.deb` — chosen
+  to keep matching postinst's baked-in `pkg0_*_all.deb` glob (already seeded into every
+  existing install's state), so selfupdate survived the switch from versioned asset names;
+  release CI asserts glob and asset name agree.
 
 ## 8. Output & exit codes
 

@@ -1,5 +1,6 @@
 #!/bin/sh
 # Build pkg0_<version>_all.deb. Run on a debian-ish box with dpkg-deb.
+# (_release.yml publishes it under the stable asset name pkg0_latest_all.deb.)
 # usage: packaging/build-deb.sh [version] [self-repo]
 set -eu
 
