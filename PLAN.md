@@ -367,7 +367,8 @@ package it manages. So self-management is not a special subsystem; it's **one mo
   glob baked in at build time), with `attest: "required"` — non-negotiable for the tool that does
   the verifying. If the state file doesn't exist yet, postinst creates it with just this entry.
   **Corollary: release CI must publish attestations from the very first shipped version, or
-  every selfupdate aborts.**
+  every selfupdate aborts.** (Implemented: `.github/workflows/` — tag push → build → smoke test
+  → attest → `gh attestation verify` gate → draft release; see RELEASING.md.)
 - **`pkg0 selfupdate`** is literal sugar for `pkg0 update pkg0`. A plain `pkg0 update` includes
   pkg0 like any other package; no special ordering. New code takes effect on the next invocation.
 - **Why in-flight replacement is safe:** dpkg installs files by unpacking to `*.dpkg-new` and

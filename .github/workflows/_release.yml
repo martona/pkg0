@@ -1,0 +1,138 @@
+name: Release pipeline (reusable)
+
+# Build + smoke-test + attest + publish. Invoked from release-tag.yml and
+# release-manual.yml; not directly triggerable. Callers compute version/tag/draft
+# and pass them in.
+#
+# The deb ships with postinst seeding pkg0 into its own state with attest:"required"
+# (PLAN.md §7.5), so an unattested release would brick every selfupdate. This
+# pipeline therefore treats attestation as load-bearing: the publish job attests,
+# then VERIFIES the attestation is live and valid via `gh attestation verify`
+# before the release is created. If that check fails, no release goes out.
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+        description: 'Debian-shaped version (no v prefix, e.g. 0.1.0)'
+      tag:
+        required: true
+        type: string
+        description: 'Full tag name including v prefix (e.g. v0.1.0)'
+      draft:
+        required: true
+        type: boolean
+        description: 'Create the GitHub release as a draft (not published)'
+
+permissions:
+  contents: write       # create release + upload assets
+  id-token: write       # sigstore OIDC for attestation
+  attestations: write   # write build provenance attestation
+
+jobs:
+  build:
+    name: Build & smoke-test deb
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Lint
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+          bash -n pkg0
+          shellcheck -x pkg0 packaging/build-deb.sh packaging/postinst
+
+      - name: Build deb
+        run: |
+          set -euo pipefail
+          sh packaging/build-deb.sh "${{ inputs.version }}" "$GITHUB_REPOSITORY"
+          mkdir -p dist
+          mv "pkg0_${{ inputs.version }}_all.deb" dist/
+          dpkg-deb -I dist/*.deb
+
+      - name: Smoke test
+        run: |
+          set -euxo pipefail
+          sudo apt-get install -y ./dist/pkg0_*.deb
+
+          # version stamped into the script
+          pkg0 version | grep -F "${{ inputs.version }}"
+
+          # postinst seeded pkg0 into its own state, attest: required, repo = this repo
+          jq -e --arg r "$GITHUB_REPOSITORY" \
+            '.[] | select(.pkg_name == "pkg0" and .repo == $r and .attest == "required")' \
+            /var/lib/pkg0/state.json
+
+          # state is root-owned 0644 (unprivileged list must read it)
+          [ "$(stat -c '%a %U' /var/lib/pkg0/state.json)" = "644 root" ]
+          pkg0 list | grep -q '^pkg0 '
+
+          # usage errors exit 2
+          rc=0; sudo pkg0 install not-a-repospec </dev/null || rc=$?
+          [ "$rc" -eq 2 ]
+
+          # non-interactive `pkg0 remove pkg0` must refuse
+          if sudo pkg0 remove pkg0 </dev/null; then
+            echo "::error::pkg0 remove pkg0 should have refused non-interactively"
+            exit 1
+          fi
+          command -v pkg0 >/dev/null
+
+          # reinstall must not clobber the seeded state entry
+          ts1=$(jq -r '.[] | select(.pkg_name == "pkg0").installed_at' /var/lib/pkg0/state.json)
+          sudo apt-get install -y --reinstall ./dist/pkg0_*.deb
+          ts2=$(jq -r '.[] | select(.pkg_name == "pkg0").installed_at' /var/lib/pkg0/state.json)
+          [ "$ts1" = "$ts2" ]
+
+          sudo apt-get remove -y pkg0
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deb
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Attest & create release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: 'dist/*.deb'
+
+      - name: Verify attestation is live
+        # pkg0 clients (and pkg0's own selfupdate) depend on this attestation being
+        # fetchable and valid — prove it against the real API before releasing.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh attestation verify dist/pkg0_*.deb --repo "$GITHUB_REPOSITORY"
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          name: ${{ inputs.tag }}
+          draft: ${{ inputs.draft }}
+          prerelease: false
+          generate_release_notes: true
+          files: dist/*
+          fail_on_unmatched_files: true

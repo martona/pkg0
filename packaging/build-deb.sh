@@ -12,6 +12,8 @@ trap 'rm -rf "$STAGE"' EXIT
 
 mkdir -p "$STAGE/DEBIAN" "$STAGE/usr/bin"
 install -m 0755 pkg0 "$STAGE/usr/bin/pkg0"
+# stamp the script's own version so `pkg0 version` matches the package version
+sed -i "s/^PKG0_VERSION=.*/PKG0_VERSION=\"$VERSION\"/" "$STAGE/usr/bin/pkg0"
 sed "s/__VERSION__/$VERSION/" packaging/control.in > "$STAGE/DEBIAN/control"
 sed "s|__SELF_REPO__|$SELF_REPO|" packaging/postinst > "$STAGE/DEBIAN/postinst"
 chmod 0755 "$STAGE/DEBIAN/postinst"

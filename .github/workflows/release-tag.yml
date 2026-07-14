@@ -1,0 +1,82 @@
+name: Release (tag)
+
+# Auto-fires when a v* tag is pushed (typically `git tag v0.1.0 && git push --tags`,
+# or GitHub UI tag creation). Always creates a draft so the release can be reviewed
+# before publication — flip via `gh release edit --draft=false v0.1.0` or the UI's
+# Publish button.
+#
+# This is the CANONICAL release path for pkg0: the attestation certificate's identity
+# comes out as .../workflows/_release.yml@refs/tags/vX.Y.Z, which matches the
+# tag-pinned identity regexp pkg0 derives for its own selfupdate verification
+# (PLAN.md §5.2). Manual-dispatch builds carry a branch ref instead — see
+# release-manual.yml for the caveat.
+#
+# No-ops when a release already exists for the tag: publishing a draft (e.g. one the
+# manual workflow built) creates the tag, which re-fires this push-triggered workflow;
+# the guard skips that duplicate build. A fresh tag push has no release yet, so it
+# builds normally — so either flow works.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.compute.outputs.version }}
+      tag: ${{ steps.compute.outputs.tag }}
+      exists: ${{ steps.check.outputs.exists }}
+    steps:
+      - id: compute
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          # debian-version-shaped: starts with a digit; digits, dots, +, ~ after
+          if [[ ! "$version" =~ ^[0-9][A-Za-z0-9.+~]*$ ]]; then
+            echo "::error::Invalid version derived from tag '$tag'"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Resolved: version=$version tag=$tag"
+
+      - id: check
+        # A release already existing for this tag means the tag was just created by
+        # publishing a draft (which the manual workflow already built) — skip the
+        # duplicate build. `gh release view` exits non-zero when no release exists, so a
+        # fresh tag push proceeds; the if/else keeps the step green either way.
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ steps.compute.outputs.tag }}"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Release $tag already exists — skipping duplicate build."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  pipeline:
+    name: Build, attest, publish
+    needs: resolve
+    if: needs.resolve.outputs.exists != 'true'
+    uses: ./.github/workflows/_release.yml
+    with:
+      version: ${{ needs.resolve.outputs.version }}
+      tag: ${{ needs.resolve.outputs.tag }}
+      draft: true
+    secrets: inherit
